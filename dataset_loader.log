@@ -1,4 +1,0 @@
-2025-11-05 11:39:02,942 - __main__ - INFO - Output directory: /home/liamb/projects/copus-nn/output
-2025-11-05 11:39:02,942 - __main__ - INFO - Starting dataset loading process for: data_path=data/stains.csv
-2025-11-05 11:39:02,942 - __main__ - ERROR - File not found: /home/liamb/projects/copus-nn/data_path=data/stains.csv
-2025-11-05 11:39:02,942 - __main__ - ERROR - File not found: File not found: /home/liamb/projects/copus-nn/data_path=data/stains.csv

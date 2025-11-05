@@ -10,21 +10,23 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 
-
 class SimpleAutoencoder(nn.Module):
     """
-    Simple autoencoder for COPUS observation data.
+    Enhanced autoencoder for COPUS observation data with layer normalization.
     
     Architecture:
-    - Input layer (24 features)
-    - Encoder: hidden layer → ReLU → latent bottleneck
-    - Decoder: hidden layer → ReLU → output layer
+    - Input layer (24 features) with layer normalization
+    - Encoder: input → LN → hidden1 → LN → ReLU → hidden2 → LN → ReLU → latent
+    - Decoder: latent → hidden1 → LN → ReLU → hidden2 → LN → ReLU → output
     - Output: sigmoid activation for reconstruction
+    
+    Layer normalization is used instead of batch normalization to better handle
+    sparse data distributions and variable feature ranges in COPUS data.
     """
     
     def __init__(self, input_dim=24, latent_dim=3, hidden_dim=16, dropout=0.1):
         """
-        Initialize autoencoder with configurable dimensions.
+        Initialize enhanced autoencoder with layer normalization.
         
         Args:
             input_dim: Input feature dimensions (default: 24 for COPUS)
@@ -38,21 +40,43 @@ class SimpleAutoencoder(nn.Module):
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
         
-        # Encoder: input → hidden → latent
+        # Input layer normalization for preprocessing sparse data
+        self.input_norm = nn.LayerNorm(input_dim, eps=1e-6, elementwise_affine=True)
+        
+        # Enhanced Encoder with additional layer and layer normalization
         self.encoder = nn.Sequential(
+            # First encoder layer
             nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
             nn.ReLU(),
             nn.Dropout(dropout),
+            
+            # Second encoder layer (new)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            
+            # Latent bottleneck
             nn.Linear(hidden_dim, latent_dim)
         )
         
-        # Decoder: latent → hidden → output
+        # Enhanced Decoder with additional layer and layer normalization
         self.decoder = nn.Sequential(
+            # First decoder layer
             nn.Linear(latent_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, input_dim),
-            nn.Sigmoid()  # Sigmoid for output reconstruction
+            
+            # Second decoder layer (new)
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            
+            # Output reconstruction (no sigmoid for wide value ranges)
+            nn.Linear(hidden_dim, input_dim)
         )
         
         # Initialize weights
@@ -68,7 +92,7 @@ class SimpleAutoencoder(nn.Module):
     
     def forward(self, x):
         """
-        Forward pass through autoencoder.
+        Forward pass through autoencoder with input preprocessing.
         
         Args:
             x: Input tensor of shape (batch_size, input_dim)
@@ -76,6 +100,9 @@ class SimpleAutoencoder(nn.Module):
         Returns:
             tuple: (reconstructed_output, latent_representation)
         """
+        # Apply input layer normalization for sparse data preprocessing
+        x = self.input_norm(x)
+        
         # Encode
         latent = self.encoder(x)
         

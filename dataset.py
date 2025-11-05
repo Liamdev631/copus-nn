@@ -68,7 +68,7 @@ class COPUSDataset(Dataset):
             raise ValueError(f"Failed to load {self.data_path}: {e}")
     
     def _create_tensors(self):
-        """Convert target columns to tensors with GPU optimization."""
+        """Convert target columns to tensors with GPU optimization and normalization."""
         tensors = {}
         
         for col in self.TARGET_COLUMNS:
@@ -77,6 +77,13 @@ class COPUSDataset(Dataset):
             
             # Fill NaN values with 0 (or could use mean/median)
             col_data = col_data.fillna(0.0)
+            
+            # Apply robust scaling to handle wide value ranges
+            # Use percentile-based scaling to handle outliers
+            q99, q01 = col_data.quantile(0.99), col_data.quantile(0.01)
+            if q99 != q01:  # Avoid division by zero
+                col_data = (col_data - q01) / (q99 - q01)
+                col_data = col_data.clip(0, 1)  # Clip to [0, 1] range
             
             # Convert to numpy array
             np_array = col_data.values.astype(np.float32)

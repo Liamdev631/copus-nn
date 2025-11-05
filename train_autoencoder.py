@@ -20,6 +20,8 @@ from dataset import COPUSDataset, create_copus_dataloader
 from models import SimpleAutoencoder
 
 # Visualization
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend to avoid Qt/Wayland issues
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -62,9 +64,10 @@ def parse_arguments():
                        help='Save trained model weights')
     parser.add_argument('--plot_freq', type=int, default=1,
                        help='Plot update frequency in epochs (default: 1)')
+    parser.add_argument('--no_log_scale', action='store_true',
+                       help='Disable log scale for loss plotting (default: False)')
     
     return parser.parse_args()
-
 
 def validate_arguments(args):
     """Validate command line arguments."""
@@ -109,8 +112,34 @@ def create_model(input_dim, latent_dim, hidden_dim):
     return model
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device):
-    """Train for one epoch."""
+def sparse_aware_loss(reconstructed, original, sparsity_weight=0.1):
+    """
+    Custom loss function that handles sparse data better.
+    
+    Combines MSE loss with L1 loss for sparse reconstruction,
+    giving more weight to non-zero elements.
+    """
+    # Standard MSE loss
+    mse_loss = nn.MSELoss()(reconstructed, original)
+    
+    # L1 loss for sparsity awareness (better for sparse data)
+    l1_loss = nn.L1Loss()(reconstructed, original)
+    
+    # Weight the losses: emphasize reconstruction of non-zero elements
+    non_zero_mask = (original != 0).float()
+    if non_zero_mask.sum() > 0:
+        weighted_mse = (non_zero_mask * (reconstructed - original) ** 2).sum() / non_zero_mask.sum()
+        weighted_l1 = (non_zero_mask * torch.abs(reconstructed - original)).sum() / non_zero_mask.sum()
+        
+        # Combine losses with emphasis on non-zero reconstruction
+        total_loss = 0.7 * weighted_mse + 0.2 * weighted_l1 + 0.1 * mse_loss
+    else:
+        total_loss = mse_loss
+    
+    return total_loss
+
+def train_epoch(model, dataloader, criterion, optimizer, device, use_sparse_loss=True):
+    """Train for one epoch with improved loss function."""
     model.train()
     total_loss = 0
     num_batches = 0
@@ -126,8 +155,11 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
         # Forward pass
         reconstructed, latent = model(batch_data)
         
-        # Calculate loss
-        loss = criterion(reconstructed, batch_data)
+        # Calculate loss with sparse awareness
+        if use_sparse_loss:
+            loss = sparse_aware_loss(reconstructed, batch_data)
+        else:
+            loss = criterion(reconstructed, batch_data)
         
         # Backward pass
         loss.backward()
@@ -139,24 +171,36 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
     return total_loss / num_batches
 
 
-def update_loss_plot(epochs, losses, current_epoch, output_dir):
+def update_loss_plot(epochs, losses, current_epoch, output_dir, use_log_scale=True):
     """Update and save loss plot."""
     plt.figure(figsize=(10, 6))
     
     # Create plot
     sns.set_style("whitegrid")
-    plt.plot(epochs[:current_epoch+1], losses[:current_epoch+1], 
-             marker='o', markersize=4, linewidth=2, color='blue')
+    
+    # Apply log transformation if requested
+    if use_log_scale:
+        # Add small epsilon to avoid log(0)
+        log_losses = np.log10(losses[:current_epoch+1] + 1e-10)
+        plt.plot(epochs[:current_epoch+1], log_losses, 
+                marker='o', markersize=4, linewidth=2, color='blue')
+        ylabel = 'Log₁₀(MSE Loss + ε)'
+        current_loss_display = np.log10(losses[current_epoch] + 1e-10)
+    else:
+        plt.plot(epochs[:current_epoch+1], losses[:current_epoch+1], 
+                marker='o', markersize=4, linewidth=2, color='blue')
+        ylabel = 'MSE Loss'
+        current_loss_display = losses[current_epoch]
     
     plt.title('Training Loss Over Time', fontsize=14, fontweight='bold')
     plt.xlabel('Epoch', fontsize=12)
-    plt.ylabel('MSE Loss', fontsize=12)
+    plt.ylabel(ylabel, fontsize=12)
     plt.grid(True, alpha=0.3)
     
     # Add current epoch info
     if current_epoch >= 0:
         plt.axvline(x=current_epoch, color='red', linestyle='--', alpha=0.5)
-        plt.text(current_epoch, losses[current_epoch], 
+        plt.text(current_epoch, current_loss_display, 
                 f'Epoch {current_epoch+1}\nLoss: {losses[current_epoch]:.4f}',
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.7),
                 fontsize=10, ha='center')
@@ -212,9 +256,9 @@ def main():
         
         print(f"Model created: {model.get_model_info()}")
         
-        # Setup training
+        # Setup training with improved settings for large networks
         criterion = nn.MSELoss()
-        optimizer = optim.Adam(model.parameters(), lr=args.initial_lr)
+        optimizer = optim.AdamW(model.parameters(), lr=args.initial_lr, weight_decay=1e-4)
         scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.eta_min)
         
         # Training tracking
@@ -226,8 +270,8 @@ def main():
         
         # Training loop
         for epoch in range(args.epochs):
-            # Train for one epoch
-            avg_loss = train_epoch(model, dataloader, criterion, optimizer, device)
+            # Train for one epoch with sparse-aware loss
+            avg_loss = train_epoch(model, dataloader, criterion, optimizer, device, use_sparse_loss=True)
             losses[epoch] = avg_loss
             
             # Update learning rate
@@ -239,7 +283,7 @@ def main():
             
             # Update plot
             if (epoch + 1) % args.plot_freq == 0:
-                plot_path = update_loss_plot(epochs, losses, epoch, output_dir)
+                plot_path = update_loss_plot(epochs, losses, epoch, output_dir, use_log_scale=not args.no_log_scale)
                 print(f"  Plot updated: {plot_path}")
         
         print("-" * 50)
@@ -254,7 +298,7 @@ def main():
             print(f"Model saved: {model_path}")
         
         # Final plot
-        final_plot_path = update_loss_plot(epochs, losses, args.epochs-1, output_dir)
+        final_plot_path = update_loss_plot(epochs, losses, args.epochs-1, output_dir, use_log_scale=not args.no_log_scale)
         print(f"Final plot saved: {final_plot_path}")
         
         print(f"\nAll outputs saved to: {output_dir}")

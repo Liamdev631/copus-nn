@@ -122,7 +122,7 @@ class SimpleAutoencoder(nn.Module):
     
     def forward(self, x):
         """
-        Forward pass through autoencoder with input preprocessing.
+        Forward pass through autoencoder with input preprocessing and skip connections.
         
         Args:
             x: Input tensor of shape (batch_size, input_dim)
@@ -131,13 +131,23 @@ class SimpleAutoencoder(nn.Module):
             tuple: (reconstructed_output, latent_representation)
         """
         # Apply input layer normalization for sparse data preprocessing
-        x = self.input_norm(x)
+        x_norm = self.input_norm(x)
         
         # Encode
-        latent = self.encoder(x)
+        latent = self.encoder(x_norm)
+        
+        # Apply skip connection from input to latent (if enabled)
+        if self.use_skip_connections:
+            latent_skip = self.input_to_latent_skip(x_norm)
+            latent = latent + latent_skip  # Element-wise addition
         
         # Decode
         reconstructed = self.decoder(latent)
+        
+        # Apply skip connection from latent to output (if enabled)
+        if self.use_skip_connections:
+            output_skip = self.latent_to_output_skip(latent)
+            reconstructed = reconstructed + output_skip  # Element-wise addition
         
         return reconstructed, latent
     
@@ -171,69 +181,101 @@ class SimpleAutoencoder(nn.Module):
             'input_dim': self.input_dim,
             'latent_dim': self.latent_dim,
             'hidden_dim': self.hidden_dim,
+            'n_hidden_layers': self.n_hidden_layers,
+            'use_skip_connections': self.use_skip_connections,
             'total_params': sum(p.numel() for p in self.parameters()),
             'encoder_params': sum(p.numel() for p in self.encoder.parameters()),
             'decoder_params': sum(p.numel() for p in self.decoder.parameters())
         }
 
 
-def create_autoencoder_for_copus(latent_dim=3, **kwargs):
+def create_autoencoder_for_copus(latent_dim=3, n_hidden_layers=2, **kwargs):
     """
     Factory function to create autoencoder optimized for COPUS data.
     
     Args:
         latent_dim: Dimension of latent space (default: 3)
+        n_hidden_layers: Number of hidden layers (default: 2)
         **kwargs: Additional arguments for SimpleAutoencoder
         
     Returns:
         SimpleAutoencoder: Configured autoencoder for COPUS data
     """
-    return SimpleAutoencoder(input_dim=24, latent_dim=latent_dim, **kwargs)
+    return SimpleAutoencoder(input_dim=24, latent_dim=latent_dim, n_hidden_layers=n_hidden_layers, **kwargs)
 
 
 class VariationalAutoencoder(nn.Module):
-    """Variational Autoencoder with layer normalization for COPUS data.
+    """Variational Autoencoder with layer normalization and skip connections for COPUS data.
 
     Encoder outputs mean and log-variance for latent distribution; decoder reconstructs input.
+    Skip connections are added from input to latent space and latent to output when n_hidden_layers > 1.
     """
 
-    def __init__(self, input_dim=24, latent_dim=3, hidden_dim=16, dropout=0.1):
+    def __init__(self, input_dim=24, latent_dim=3, hidden_dim=16, dropout=0.1, n_hidden_layers=2):
         super().__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
+        self.n_hidden_layers = max(1, n_hidden_layers)
 
         self.input_norm = nn.LayerNorm(input_dim, eps=1e-6, elementwise_affine=True)
 
-        # Encoder that outputs mu and logvar
-        self.encoder_net = nn.Sequential(
+        # Build encoder network dynamically based on n_hidden_layers
+        encoder_layers = []
+        
+        # First encoder layer (always present)
+        encoder_layers.extend([
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
             nn.ReLU(),
-            nn.Dropout(dropout),
-
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
+            nn.Dropout(dropout)
+        ])
+        
+        # Additional hidden layers
+        for i in range(1, self.n_hidden_layers):
+            encoder_layers.extend([
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            ])
+        
+        self.encoder_net = nn.Sequential(*encoder_layers)
+        
+        # Output layers for mu and logvar
         self.fc_mu = nn.Linear(hidden_dim, latent_dim)
         self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
 
-        # Decoder from latent
-        self.decoder = nn.Sequential(
+        # Build decoder network dynamically based on n_hidden_layers
+        decoder_layers = []
+        
+        # First decoder layer (always present)
+        decoder_layers.extend([
             nn.Linear(latent_dim, hidden_dim),
             nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout(dropout)
+        ])
+        
+        # Additional hidden layers
+        for i in range(1, self.n_hidden_layers):
+            decoder_layers.extend([
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            ])
+        
+        # Final decoder layer to output space
+        decoder_layers.append(nn.Linear(hidden_dim, input_dim))
+        
+        self.decoder = nn.Sequential(*decoder_layers)
 
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-
-            nn.Linear(hidden_dim, input_dim)
-        )
+        # Skip connections (only if more than 1 hidden layer)
+        self.use_skip_connections = self.n_hidden_layers > 1
+        if self.use_skip_connections:
+            self.input_to_latent_skip = nn.Linear(input_dim, latent_dim)
+            self.latent_to_output_skip = nn.Linear(latent_dim, input_dim)
 
         self._initialize_weights()
 
@@ -245,10 +287,17 @@ class VariationalAutoencoder(nn.Module):
                     init.zeros_(module.bias)
 
     def encode(self, x):
-        x = self.input_norm(x)
-        h = self.encoder_net(x)
+        x_norm = self.input_norm(x)
+        h = self.encoder_net(x_norm)
         mu = self.fc_mu(h)
         logvar = self.fc_logvar(h)
+        
+        # Apply skip connection from input to latent (if enabled)
+        if self.use_skip_connections:
+            latent_skip = self.input_to_latent_skip(x_norm)
+            mu = mu + latent_skip
+            logvar = logvar + latent_skip
+        
         return mu, logvar
 
     def reparameterize(self, mu, logvar):
@@ -257,7 +306,14 @@ class VariationalAutoencoder(nn.Module):
         return mu + eps * std
 
     def decode(self, z):
-        return self.decoder(z)
+        recon = self.decoder(z)
+        
+        # Apply skip connection from latent to output (if enabled)
+        if self.use_skip_connections:
+            output_skip = self.latent_to_output_skip(z)
+            recon = recon + output_skip
+        
+        return recon
 
     def forward(self, x):
         mu, logvar = self.encode(x)
@@ -270,6 +326,8 @@ class VariationalAutoencoder(nn.Module):
             'input_dim': self.input_dim,
             'latent_dim': self.latent_dim,
             'hidden_dim': self.hidden_dim,
+            'n_hidden_layers': self.n_hidden_layers,
+            'use_skip_connections': self.use_skip_connections,
             'total_params': sum(p.numel() for p in self.parameters())
         }
 

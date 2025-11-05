@@ -29,7 +29,7 @@ This repository implements an autoencoder-based approach to:
 copus-nn/
 ├── dataset.py                    # COPUS dataset loading and preprocessing
 ├── models.py                     # Autoencoder model definitions
-├── dynamic_models.py             # Dynamic autoencoder architectures
+├── models.py                     # Autoencoder model definitions (includes dynamic architecture)
 ├── train_autoencoder.py          # Basic autoencoder training script
 ├── train_multiple_latent_dims.py # Multi-dimensional analysis pipeline
 ├── hyperparam_optimizer.py       # Hyperparameter optimization for hidden layers
@@ -61,6 +61,32 @@ Systematically searches for optimal hidden layer configurations given a fixed la
 
 ### 3. `train_autoencoder.py`
 Basic autoencoder training script for single model training with customizable architecture.
+
+## Refactor Summary (2025-11)
+
+- Consolidated shared helpers into `utils.py` (losses, device/output setup, training loops, evaluation, plotting, and `create_model` factory).
+- Merged the dynamic autoencoder into `models.py` and removed the legacy `dynamic_models.py` file.
+- Updated `train_autoencoder.py` and `hyperparam_optimizer.py` to import helpers from `utils.py` and use unified `create_model`.
+- Added unit tests under `./tests/test_models_and_utils.py` using `unittest` covering model forwards, losses, training loops, factory variants, and evaluation.
+
+### Running Tests
+
+Use Python’s standard library test runner:
+
+```bash
+python -m tests.test_models_and_utils
+```
+
+### Key APIs
+
+- `utils.create_model(input_dim, latent_dim, hidden_dims, mode, num_clusters=None, use_dynamic=False)`
+  - Returns `(model, prior)` where `prior` is `None` unless `mode == 'vade'`.
+- Training loops:
+  - `train_epoch_ae(model, dataloader, criterion, optimizer, device, use_sparse_loss=True, ...)`
+  - `train_epoch_vae(model, dataloader, optimizer, device, ...)`
+  - `train_epoch_vade(model, prior, dataloader, optimizer, device, ...)`
+- Evaluation:
+  - `evaluate_model(model, dataloader, device, use_sparse_loss=True, ...) -> float`
 
 ## Autoencoder Architecture
 

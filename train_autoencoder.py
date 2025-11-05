@@ -19,7 +19,18 @@ import numpy as np
 # Import custom modules
 from dataset import COPUSDataset, create_copus_dataloader
 from models import SimpleAutoencoder, VariationalAutoencoder, GaussMixturePrior
-# from utils import create_combined_plot  # No longer used; using local plotting helpers
+from utils import (
+    setup_output_dir,
+    setup_device,
+    sparse_aware_loss,
+    kl_standard_normal,
+    evaluate_model,
+    train_epoch_ae,
+    train_epoch_vae,
+    train_epoch_vade,
+    create_model,
+    create_combined_plot,
+)
 
 # Visualization
 import matplotlib
@@ -27,11 +38,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 
-def setup_output_dir(output_dir_path='output'):
-    """Create output directory if it doesn't exist."""
-    output_dir = Path(output_dir_path)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir
+# setup_output_dir is now imported from utils
 
 
 def setup_matplotlib_backend(interactive: bool):
@@ -160,187 +167,24 @@ def validate_arguments(args):
         print("Sparse loss disabled (sparse_weight=0)")
 
 
-def setup_device(device_arg):
-    """Setup computing device with proper GPU utilization."""
-    if device_arg == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    else:
-        device = device_arg
-    
-    print(f"Using device: {device}")
-    
-    # Additional GPU setup if CUDA is available
-    if device == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name()}")
-        print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-        # Enable memory optimization
-        torch.cuda.empty_cache()
-        # Enable cuDNN benchmarking for better performance
-        torch.backends.cudnn.benchmark = True
-    
-    return device
+# setup_device is now imported from utils
 
 
-def create_model(input_dim, latent_dim, hidden_dims, mode, num_clusters=None):
-    """Create model based on training mode with dynamic hidden dimensions."""
-    if mode == 'ae':
-        model = SimpleAutoencoder(
-            input_dim=input_dim,
-            latent_dim=latent_dim,
-            hidden_dim=hidden_dims[0],  # Use first dimension for compatibility
-            dropout=0.1
-        )
-        return model, None
-    else:
-        vae = VariationalAutoencoder(
-            input_dim=input_dim,
-            latent_dim=latent_dim,
-            hidden_dim=hidden_dims[0],  # Use first dimension for compatibility
-            dropout=0.1
-        )
-        if mode == 'vae':
-            return vae, None
-        elif mode == 'vade':
-            prior = GaussMixturePrior(num_components=num_clusters, latent_dim=latent_dim)
-            return vae, prior
-        else:
-            raise ValueError(f"Unsupported mode: {mode}")
+# create_model is provided in utils for consolidated usage (if needed elsewhere)
 
 
-def sparse_aware_loss(reconstructed, original, mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
-    """
-    Configurable sparse-aware loss function.
-    
-    Combines MSE loss with L1 loss for sparse reconstruction,
-    with configurable weights for each component.
-    
-    Args:
-        reconstructed: Reconstructed data
-        original: Original data
-        mse_weight: Weight for MSE loss component
-        l1_weight: Weight for L1 loss component  
-        sparse_weight: Weight for sparse reconstruction component
-    """
-    # Standard MSE loss
-    mse_loss = nn.MSELoss()(reconstructed, original)
-    
-    # L1 loss for sparsity awareness (better for sparse data)
-    l1_loss = nn.L1Loss()(reconstructed, original)
-    
-    # Weight the losses: emphasize reconstruction of non-zero elements
-    non_zero_mask = (original != 0).float()
-    if non_zero_mask.sum() > 0:
-        weighted_mse = (non_zero_mask * (reconstructed - original) ** 2).sum() / non_zero_mask.sum()
-        weighted_l1 = (non_zero_mask * torch.abs(reconstructed - original)).sum() / non_zero_mask.sum()
-        
-        # Combine losses with configurable weights
-        total_loss = mse_weight * weighted_mse + l1_weight * weighted_l1 + sparse_weight * mse_loss
-    else:
-        total_loss = mse_loss
-    
-    return total_loss
+# sparse_aware_loss now imported from utils
 
-def kl_standard_normal(mu, logvar):
-    """KL divergence between q(z|x)=N(mu,diag(var)) and p(z)=N(0,I). Returns (batch,)."""
-    return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+# kl_standard_normal now imported from utils
 
-def train_epoch_ae(model, dataloader, criterion, optimizer, device, use_sparse_loss=True, 
-                   mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
-    """Train AE for one epoch with proper device handling and configurable loss weights."""
-    model.train()
-    model = model.to(device)
-    total_loss = 0
-    num_batches = 0
-    for batch_data in dataloader:
-        batch_data = batch_data.to(device)
-        optimizer.zero_grad()
-        reconstructed, _ = model(batch_data)
-        if use_sparse_loss:
-            loss = sparse_aware_loss(reconstructed, batch_data, mse_weight, l1_weight, sparse_weight)
-        else:
-            loss = criterion(reconstructed, batch_data)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-        num_batches += 1
-    return total_loss / num_batches
+# train_epoch_ae now imported from utils
 
-def train_epoch_vae(model, dataloader, optimizer, device, mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
-    """Train VAE for one epoch with configurable sparse-aware reconstruction + KL to N(0,I)."""
-    model.train()
-    model = model.to(device)
-    total_loss = 0
-    num_batches = 0
-    for batch_data in dataloader:
-        batch_data = batch_data.to(device)
-        optimizer.zero_grad()
-        recon, z, mu, logvar = model(batch_data)
-        recon_loss = sparse_aware_loss(recon, batch_data, mse_weight, l1_weight, sparse_weight)
-        kl = kl_standard_normal(mu, logvar).mean()
-        loss = recon_loss + kl
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-        num_batches += 1
-    return total_loss / num_batches
+# train_epoch_vae now imported from utils
 
-def train_epoch_vade(model, prior, dataloader, optimizer, device, mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
-    """Train VaDE (VAE with GMM prior) for one epoch with configurable sparse reconstruction.
-
-    Total loss = reconstruction + KL(q(z|x) || p(z|c)) + KL(q(c|x) || p(c)).
-    """
-    model.train()
-    model = model.to(device)
-    if prior is not None:
-        prior = prior.to(device)
-    total_loss = 0
-    num_batches = 0
-    for batch_data in dataloader:
-        batch_data = batch_data.to(device)
-        optimizer.zero_grad()
-        recon, z, mu, logvar = model(batch_data)
-        recon_loss = sparse_aware_loss(recon, batch_data, mse_weight, l1_weight, sparse_weight)
-        gamma = prior.responsibilities(mu)  # (N, K)
-        kl_z = prior.kl_z_given_c(mu, logvar, gamma).mean()
-        kl_c = prior.kl_c(gamma).mean()
-        loss = recon_loss + kl_z + kl_c
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-        num_batches += 1
-    return total_loss / num_batches
+# train_epoch_vade now imported from utils
 
 
-def evaluate_model(model, dataloader, device, use_sparse_loss=True, mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
-    """Evaluate model on a dataloader and return average reconstruction loss.
-
-    Uses the same sparse-aware reconstruction loss as training when enabled.
-    """
-    model.eval()
-    total_loss = 0.0
-    num_batches = 0
-
-    with torch.no_grad():
-        for batch_data in dataloader:
-            # Handle device placement for CPU scenarios
-            if device == 'cpu' and getattr(batch_data, 'device', device) != device:
-                batch_data = batch_data.to(device)
-
-            outputs = model(batch_data)
-            if isinstance(outputs, tuple) and len(outputs) >= 2:
-                reconstructed = outputs[0]
-            else:
-                reconstructed = outputs
-
-            if use_sparse_loss:
-                loss = sparse_aware_loss(reconstructed, batch_data, mse_weight, l1_weight, sparse_weight)
-            else:
-                loss = nn.MSELoss()(reconstructed, batch_data)
-
-            total_loss += loss.item()
-            num_batches += 1
-
-    return total_loss / max(num_batches, 1)
+# evaluate_model now imported from utils
 
 
 def plot_realtime_losses(train_losses, test_losses, current_epoch, output_dir, use_log_scale=True):

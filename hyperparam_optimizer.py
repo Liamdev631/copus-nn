@@ -22,8 +22,7 @@ from torch.utils.data import DataLoader, random_split
 
 # Import custom modules
 from dataset import COPUSDataset, create_copus_dataloader
-from dynamic_models import create_dynamic_autoencoder
-from models import SimpleAutoencoder, VariationalAutoencoder, GaussMixturePrior
+from models import SimpleAutoencoder, VariationalAutoencoder, GaussMixturePrior, create_dynamic_autoencoder
 
 # Visualization
 import matplotlib
@@ -31,131 +30,26 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-def kl_standard_normal(mu, logvar):
-    """KL divergence between q(z|x)=N(mu,diag(var)) and p(z)=N(0,I). Returns (batch,)."""
-    return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+from utils import (
+    setup_device,
+    evaluate_model,
+    train_epoch_ae,
+    train_epoch_vae,
+    train_epoch_vade,
+    sparse_aware_loss,
+    kl_standard_normal,
+    create_model,
+)
 
-def create_model(input_dim, latent_dim, hidden_dims, mode, num_clusters=None):
-    """Create model based on training mode with dynamic hidden dimensions."""
-    if mode == 'ae':
-        model = SimpleAutoencoder(
-            input_dim=input_dim,
-            latent_dim=latent_dim,
-            hidden_dim=hidden_dims[0],  # Use first dimension for compatibility
-            dropout=0.1
-        )
-        return model, None
-    else:
-        vae = VariationalAutoencoder(
-            input_dim=input_dim,
-            latent_dim=latent_dim,
-            hidden_dim=hidden_dims[0],  # Use first dimension for compatibility
-            dropout=0.1
-        )
-        if mode == 'vae':
-            return vae, None
-        elif mode == 'vade':
-            prior = GaussMixturePrior(num_components=num_clusters, latent_dim=latent_dim)
-            return vae, prior
-        else:
-            raise ValueError(f"Unsupported mode: {mode}")
+# create_model is now imported from utils
 
-def evaluate_model(model, dataloader, device, use_sparse_loss=True, mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
-    """Evaluate model on a dataloader and return average reconstruction loss.
+# evaluate_model now imported from utils
 
-    Uses the same sparse-aware reconstruction loss as training when enabled.
-    """
-    model.eval()
-    total_loss = 0.0
-    num_batches = 0
+# train_epoch_ae now imported from utils
 
-    with torch.no_grad():
-        for batch_data in dataloader:
-            # Handle device placement for CPU scenarios
-            if device == 'cpu' and getattr(batch_data, 'device', device) != device:
-                batch_data = batch_data.to(device)
+# train_epoch_vae now imported from utils
 
-            outputs = model(batch_data)
-            if isinstance(outputs, tuple) and len(outputs) >= 2:
-                reconstructed = outputs[0]
-            else:
-                reconstructed = outputs
-
-            if use_sparse_loss:
-                loss = sparse_aware_loss(reconstructed, batch_data, mse_weight, l1_weight, sparse_weight)
-            else:
-                loss = nn.MSELoss()(reconstructed, batch_data)
-
-            total_loss += loss.item()
-            num_batches += 1
-
-    return total_loss / max(num_batches, 1)
-
-def train_epoch_ae(model, dataloader, criterion, optimizer, device, use_sparse_loss=True, 
-                   mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
-    """Train AE for one epoch with proper device handling and configurable loss weights."""
-    model.train()
-    model = model.to(device)
-    total_loss = 0
-    num_batches = 0
-    for batch_data in dataloader:
-        batch_data = batch_data.to(device)
-        optimizer.zero_grad()
-        reconstructed, _ = model(batch_data)
-        if use_sparse_loss:
-            loss = sparse_aware_loss(reconstructed, batch_data, mse_weight, l1_weight, sparse_weight)
-        else:
-            loss = criterion(reconstructed, batch_data)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-        num_batches += 1
-    return total_loss / num_batches
-
-def train_epoch_vae(model, dataloader, optimizer, device, mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
-    """Train VAE for one epoch with configurable sparse-aware reconstruction + KL to N(0,I)."""
-    model.train()
-    model = model.to(device)
-    total_loss = 0
-    num_batches = 0
-    for batch_data in dataloader:
-        batch_data = batch_data.to(device)
-        optimizer.zero_grad()
-        recon, z, mu, logvar = model(batch_data)
-        recon_loss = sparse_aware_loss(recon, batch_data, mse_weight, l1_weight, sparse_weight)
-        kl = kl_standard_normal(mu, logvar).mean()
-        loss = recon_loss + kl
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-        num_batches += 1
-    return total_loss / num_batches
-
-def train_epoch_vade(model, prior, dataloader, optimizer, device, mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
-    """Train VaDE (VAE with GMM prior) for one epoch with configurable sparse reconstruction.
-
-    Total loss = reconstruction + KL(q(z|x) || p(z|c)) + KL(q(c|x) || p(c)).
-    """
-    model.train()
-    model = model.to(device)
-    if prior is not None:
-        prior = prior.to(device)
-    total_loss = 0
-    num_batches = 0
-    for batch_data in dataloader:
-        batch_data = batch_data.to(device)
-        optimizer.zero_grad()
-        recon, z, mu, logvar = model(batch_data)
-        recon_loss = sparse_aware_loss(recon, batch_data, mse_weight, l1_weight, sparse_weight)
-        gamma = prior.responsibilities(mu)  # (N, K)
-        kl_z = prior.kl_z_given_c(mu, logvar, gamma).mean()
-        kl_c = prior.kl_c(gamma).mean()
-        loss = recon_loss + kl_z + kl_c
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-        num_batches += 1
-    return total_loss / num_batches
+# train_epoch_vade now imported from utils
 
 
 def parse_arguments():
@@ -259,15 +153,7 @@ def validate_arguments(args):
         print("Sparse loss disabled (sparse_weight=0)")
 
 
-def setup_device(device_arg: str) -> str:
-    """Setup computing device."""
-    if device_arg == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    else:
-        device = device_arg
-    
-    print(f"Using device: {device}")
-    return device
+# setup_device now imported from utils
 
 
 def generate_hidden_configs(search_dims: List[int], max_layers: int) -> List[List[int]]:

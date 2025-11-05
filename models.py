@@ -9,6 +9,7 @@ Optimized for experimental use with clear, readable implementation.
 import torch
 import torch.nn as nn
 import torch.nn.init as init
+import torch.nn.functional as F
 
 class SimpleAutoencoder(nn.Module):
     """
@@ -159,6 +160,179 @@ def create_autoencoder_for_copus(latent_dim=3, **kwargs):
         SimpleAutoencoder: Configured autoencoder for COPUS data
     """
     return SimpleAutoencoder(input_dim=24, latent_dim=latent_dim, **kwargs)
+
+
+class VariationalAutoencoder(nn.Module):
+    """Variational Autoencoder with layer normalization for COPUS data.
+
+    Encoder outputs mean and log-variance for latent distribution; decoder reconstructs input.
+    """
+
+    def __init__(self, input_dim=24, latent_dim=3, hidden_dim=16, dropout=0.1):
+        super().__init__()
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+
+        self.input_norm = nn.LayerNorm(input_dim, eps=1e-6, elementwise_affine=True)
+
+        # Encoder that outputs mu and logvar
+        self.encoder_net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+
+        # Decoder from latent
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+
+            nn.Linear(hidden_dim, input_dim)
+        )
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    init.zeros_(module.bias)
+
+    def encode(self, x):
+        x = self.input_norm(x)
+        h = self.encoder_net(x)
+        mu = self.fc_mu(h)
+        logvar = self.fc_logvar(h)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        recon = self.decode(z)
+        return recon, z, mu, logvar
+
+    def get_model_info(self):
+        return {
+            'input_dim': self.input_dim,
+            'latent_dim': self.latent_dim,
+            'hidden_dim': self.hidden_dim,
+            'total_params': sum(p.numel() for p in self.parameters())
+        }
+
+
+class GaussMixturePrior(nn.Module):
+    """Learnable Gaussian Mixture prior for VaDE.
+
+    Parameters:
+        - pi_logits: unnormalized log mixing coefficients (K)
+        - mu: component means (K, latent_dim)
+        - logvar: component log-variances (K, latent_dim)
+    """
+
+    def __init__(self, num_components: int, latent_dim: int):
+        super().__init__()
+        self.num_components = num_components
+        self.latent_dim = latent_dim
+
+        self.pi_logits = nn.Parameter(torch.zeros(num_components))
+        self.mu = nn.Parameter(torch.zeros(num_components, latent_dim))
+        self.logvar = nn.Parameter(torch.zeros(num_components, latent_dim))
+
+    def pi(self):
+        return F.softmax(self.pi_logits, dim=0)  # (K)
+
+    def responsibilities(self, z_mu: torch.Tensor):
+        """Compute responsibilities gamma_k for each sample using z mean.
+
+        Args:
+            z_mu: (N, D) latent means from encoder
+        Returns:
+            gamma: (N, K) responsibilities
+        """
+        N, D = z_mu.shape
+        K = self.num_components
+        pi = self.pi()  # (K)
+        var = torch.exp(self.logvar)  # (K, D)
+
+        # Compute log probability for each component
+        # log N(z | mu_k, var_k)
+        z_mu_exp = z_mu.unsqueeze(1)  # (N, 1, D)
+        mu = self.mu.unsqueeze(0)      # (1, K, D)
+        var_exp = var.unsqueeze(0)     # (1, K, D)
+
+        log_prob = -0.5 * (
+            torch.sum(torch.log(2 * torch.pi * var_exp), dim=2) +
+            torch.sum((z_mu_exp - mu) ** 2 / var_exp, dim=2)
+        )  # (N, K)
+
+        log_pi = torch.log(pi + 1e-12).unsqueeze(0)  # (1, K)
+        logits = log_pi + log_prob  # (N, K)
+        gamma = F.softmax(logits, dim=1)
+        return gamma
+
+    def kl_z_given_c(self, z_mu: torch.Tensor, z_logvar: torch.Tensor, gamma: torch.Tensor):
+        """Compute KL(q(z|x) || p(z|c)) weighted by responsibilities.
+
+        Returns:
+            kl_z: (N,) KL per sample
+        """
+        var_k = torch.exp(self.logvar)  # (K, D)
+        mu_k = self.mu  # (K, D)
+
+        z_var = torch.exp(z_logvar)  # (N, D)
+        N, D = z_mu.shape
+        K = self.num_components
+
+        # Expand for broadcasting
+        z_mu_e = z_mu.unsqueeze(1)      # (N, 1, D)
+        z_logvar_e = z_logvar.unsqueeze(1)  # (N, 1, D)
+        z_var_e = z_var.unsqueeze(1)    # (N, 1, D)
+        mu_k_e = mu_k.unsqueeze(0)      # (1, K, D)
+        var_k_e = var_k.unsqueeze(0)    # (1, K, D)
+
+        # KL between two Gaussians: 0.5 * [log|Σ_k| - log|Σ_z| - D + tr(Σ_k^{-1} Σ_z) + (μ_z - μ_k)^T Σ_k^{-1} (μ_z - μ_k)]
+        log_det_ratio = torch.sum(torch.log(var_k_e + 1e-12) - z_logvar_e, dim=2)  # (N, K)
+        trace_term = torch.sum(z_var_e / (var_k_e + 1e-12), dim=2)  # (N, K)
+        quad_term = torch.sum((z_mu_e - mu_k_e) ** 2 / (var_k_e + 1e-12), dim=2)  # (N, K)
+
+        kl_per_k = 0.5 * (log_det_ratio - D + trace_term + quad_term)  # (N, K)
+
+        # Weight by responsibilities
+        kl_weighted = torch.sum(gamma * kl_per_k, dim=1)  # (N,)
+        return kl_weighted
+
+    def kl_c(self, gamma: torch.Tensor):
+        """KL for cluster assignments: -E_q[log p(c)] + E_q[log q(c|x)]."""
+        pi = self.pi()  # (K)
+        log_pi = torch.log(pi + 1e-12).unsqueeze(0)  # (1, K)
+        kl_c = -torch.sum(gamma * log_pi, dim=1) + torch.sum(gamma * torch.log(gamma + 1e-12), dim=1)
+        return kl_c  # (N,)
+
 
 
 def main():

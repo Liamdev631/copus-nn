@@ -13,72 +13,101 @@ import torch.nn.functional as F
 
 class SimpleAutoencoder(nn.Module):
     """
-    Enhanced autoencoder for COPUS observation data with layer normalization.
+    Enhanced autoencoder for COPUS observation data with layer normalization and skip connections.
     
     Architecture:
     - Input layer (24 features) with layer normalization
     - Encoder: input → LN → hidden1 → LN → ReLU → hidden2 → LN → ReLU → latent
     - Decoder: latent → hidden1 → LN → ReLU → hidden2 → LN → ReLU → output
+    - Skip connections: input→latent (encoder) and latent→output (decoder) when n_hidden_layers > 1
     - Output: sigmoid activation for reconstruction
     
     Layer normalization is used instead of batch normalization to better handle
     sparse data distributions and variable feature ranges in COPUS data.
+    
+    Skip connections provide residual pathways that improve gradient flow and preserve
+    input information, activated only when the model has more than 1 hidden layer.
     """
     
-    def __init__(self, input_dim=24, latent_dim=3, hidden_dim=16, dropout=0.1):
+    def __init__(self, input_dim=24, latent_dim=3, hidden_dim=16, dropout=0.1, n_hidden_layers=2):
         """
-        Initialize enhanced autoencoder with layer normalization.
+        Initialize enhanced autoencoder with layer normalization and skip connections.
         
         Args:
             input_dim: Input feature dimensions (default: 24 for COPUS)
             latent_dim: Bottleneck dimension (default: 3)
             hidden_dim: Hidden layer size (default: 16)
             dropout: Dropout rate for regularization (default: 0.1)
+            n_hidden_layers: Number of hidden layers (default: 2, must be >= 1)
         """
         super(SimpleAutoencoder, self).__init__()
         
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
+        self.n_hidden_layers = max(1, n_hidden_layers)  # Ensure at least 1 hidden layer
         
         # Input layer normalization for preprocessing sparse data
         self.input_norm = nn.LayerNorm(input_dim, eps=1e-6, elementwise_affine=True)
         
-        # Enhanced Encoder with additional layer and layer normalization
-        self.encoder = nn.Sequential(
-            # First encoder layer
+        # Build encoder layers dynamically based on n_hidden_layers
+        encoder_layers = []
+        
+        # First encoder layer (always present)
+        encoder_layers.extend([
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            # Second encoder layer (new)
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            # Latent bottleneck
-            nn.Linear(hidden_dim, latent_dim)
-        )
+            nn.Dropout(dropout)
+        ])
         
-        # Enhanced Decoder with additional layer and layer normalization
-        self.decoder = nn.Sequential(
-            # First decoder layer
+        # Additional hidden layers
+        for i in range(1, self.n_hidden_layers):
+            encoder_layers.extend([
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            ])
+        
+        # Final encoder layer to latent space
+        encoder_layers.append(nn.Linear(hidden_dim, latent_dim))
+        
+        self.encoder = nn.Sequential(*encoder_layers)
+        
+        # Skip connection from input to latent (only if more than 1 hidden layer)
+        self.use_skip_connections = self.n_hidden_layers > 1
+        if self.use_skip_connections:
+            self.input_to_latent_skip = nn.Linear(input_dim, latent_dim)
+        
+        # Build decoder layers dynamically based on n_hidden_layers
+        decoder_layers = []
+        
+        # First decoder layer (always present)
+        decoder_layers.extend([
             nn.Linear(latent_dim, hidden_dim),
             nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            # Second decoder layer (new)
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            # Output reconstruction (no sigmoid for wide value ranges)
-            nn.Linear(hidden_dim, input_dim)
-        )
+            nn.Dropout(dropout)
+        ])
+        
+        # Additional hidden layers
+        for i in range(1, self.n_hidden_layers):
+            decoder_layers.extend([
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            ])
+        
+        # Final decoder layer to output space
+        decoder_layers.append(nn.Linear(hidden_dim, input_dim))
+        
+        self.decoder = nn.Sequential(*decoder_layers)
+        
+        # Skip connection from latent to output (only if more than 1 hidden layer)
+        if self.use_skip_connections:
+            self.latent_to_output_skip = nn.Linear(latent_dim, input_dim)
         
         # Initialize weights
         self._initialize_weights()

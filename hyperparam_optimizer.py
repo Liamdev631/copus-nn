@@ -23,12 +23,139 @@ from torch.utils.data import DataLoader, random_split
 # Import custom modules
 from dataset import COPUSDataset, create_copus_dataloader
 from dynamic_models import create_dynamic_autoencoder
+from models import SimpleAutoencoder, VariationalAutoencoder, GaussMixturePrior
 
 # Visualization
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+def kl_standard_normal(mu, logvar):
+    """KL divergence between q(z|x)=N(mu,diag(var)) and p(z)=N(0,I). Returns (batch,)."""
+    return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+
+def create_model(input_dim, latent_dim, hidden_dims, mode, num_clusters=None):
+    """Create model based on training mode with dynamic hidden dimensions."""
+    if mode == 'ae':
+        model = SimpleAutoencoder(
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dims[0],  # Use first dimension for compatibility
+            dropout=0.1
+        )
+        return model, None
+    else:
+        vae = VariationalAutoencoder(
+            input_dim=input_dim,
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dims[0],  # Use first dimension for compatibility
+            dropout=0.1
+        )
+        if mode == 'vae':
+            return vae, None
+        elif mode == 'vade':
+            prior = GaussMixturePrior(num_components=num_clusters, latent_dim=latent_dim)
+            return vae, prior
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
+
+def evaluate_model(model, dataloader, device, use_sparse_loss=True, mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
+    """Evaluate model on a dataloader and return average reconstruction loss.
+
+    Uses the same sparse-aware reconstruction loss as training when enabled.
+    """
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+
+    with torch.no_grad():
+        for batch_data in dataloader:
+            # Handle device placement for CPU scenarios
+            if device == 'cpu' and getattr(batch_data, 'device', device) != device:
+                batch_data = batch_data.to(device)
+
+            outputs = model(batch_data)
+            if isinstance(outputs, tuple) and len(outputs) >= 2:
+                reconstructed = outputs[0]
+            else:
+                reconstructed = outputs
+
+            if use_sparse_loss:
+                loss = sparse_aware_loss(reconstructed, batch_data, mse_weight, l1_weight, sparse_weight)
+            else:
+                loss = nn.MSELoss()(reconstructed, batch_data)
+
+            total_loss += loss.item()
+            num_batches += 1
+
+    return total_loss / max(num_batches, 1)
+
+def train_epoch_ae(model, dataloader, criterion, optimizer, device, use_sparse_loss=True, 
+                   mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
+    """Train AE for one epoch with proper device handling and configurable loss weights."""
+    model.train()
+    model = model.to(device)
+    total_loss = 0
+    num_batches = 0
+    for batch_data in dataloader:
+        batch_data = batch_data.to(device)
+        optimizer.zero_grad()
+        reconstructed, _ = model(batch_data)
+        if use_sparse_loss:
+            loss = sparse_aware_loss(reconstructed, batch_data, mse_weight, l1_weight, sparse_weight)
+        else:
+            loss = criterion(reconstructed, batch_data)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        num_batches += 1
+    return total_loss / num_batches
+
+def train_epoch_vae(model, dataloader, optimizer, device, mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
+    """Train VAE for one epoch with configurable sparse-aware reconstruction + KL to N(0,I)."""
+    model.train()
+    model = model.to(device)
+    total_loss = 0
+    num_batches = 0
+    for batch_data in dataloader:
+        batch_data = batch_data.to(device)
+        optimizer.zero_grad()
+        recon, z, mu, logvar = model(batch_data)
+        recon_loss = sparse_aware_loss(recon, batch_data, mse_weight, l1_weight, sparse_weight)
+        kl = kl_standard_normal(mu, logvar).mean()
+        loss = recon_loss + kl
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        num_batches += 1
+    return total_loss / num_batches
+
+def train_epoch_vade(model, prior, dataloader, optimizer, device, mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
+    """Train VaDE (VAE with GMM prior) for one epoch with configurable sparse reconstruction.
+
+    Total loss = reconstruction + KL(q(z|x) || p(z|c)) + KL(q(c|x) || p(c)).
+    """
+    model.train()
+    model = model.to(device)
+    if prior is not None:
+        prior = prior.to(device)
+    total_loss = 0
+    num_batches = 0
+    for batch_data in dataloader:
+        batch_data = batch_data.to(device)
+        optimizer.zero_grad()
+        recon, z, mu, logvar = model(batch_data)
+        recon_loss = sparse_aware_loss(recon, batch_data, mse_weight, l1_weight, sparse_weight)
+        gamma = prior.responsibilities(mu)  # (N, K)
+        kl_z = prior.kl_z_given_c(mu, logvar, gamma).mean()
+        kl_c = prior.kl_c(gamma).mean()
+        loss = recon_loss + kl_z + kl_c
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        num_batches += 1
+    return total_loss / num_batches
 
 
 def parse_arguments():
@@ -44,6 +171,12 @@ def parse_arguments():
                        help='Comma-separated list of hidden dimensions to test (default: 16,32,64,128)')
     parser.add_argument('--max_layers', type=int, default=3,
                        help='Maximum number of hidden layers (default: 3)')
+    
+    # Model architecture
+    parser.add_argument('--mode', type=str, default='ae', choices=['ae', 'vae', 'vade'],
+                       help='Training mode: ae (autoencoder), vae (variational autoencoder), vade (VaDE with GMM prior)')
+    parser.add_argument('--num_clusters', type=int, default=8,
+                       help='Number of mixture components for VaDE (default: 8)')
     
     # Training configuration
     parser.add_argument('--epochs', type=int, default=20,
@@ -66,8 +199,64 @@ def parse_arguments():
                        help='Output directory (default: output/hyperparameters)')
     parser.add_argument('--save_models', action='store_true',
                        help='Save best model weights')
+    parser.add_argument('--plot_freq', type=int, default=1,
+                       help='Plot update frequency in epochs (default: 1)')
+    parser.add_argument('--interactive_3d', action='store_true',
+                       help='Enable interactive 3D plot popup window for latent space visualization (default: False)')
+    
+    # Loss function configuration
+    parser.add_argument('--loss_weights', type=str, default='[0.7, 0.2, 0.1]',
+                       help='JSON list of loss weights [mse_weight, l1_weight, sparse_weight] (default: [0.7, 0.2, 0.1])')
+    parser.add_argument('--mse_weight', type=float, default=0.7,
+                       help='Weight for MSE loss component (default: 0.7)')
+    parser.add_argument('--l1_weight', type=float, default=0.2,
+                       help='Weight for L1 loss component (default: 0.2)')
+    parser.add_argument('--sparse_weight', type=float, default=0.0,
+                       help='Weight for sparse reconstruction component (default: 0.0, disabled)')
     
     return parser.parse_args()
+
+
+def validate_arguments(args):
+    """Validate command line arguments."""
+    if args.latent_dim <= 0:
+        raise ValueError(f"Latent dimension must be positive, got {args.latent_dim}")
+    
+    if args.initial_lr <= 0 or args.eta_min <= 0:
+        raise ValueError("Learning rates must be positive")
+    
+    if args.batch_size <= 0:
+        raise ValueError(f"Batch size must be positive, got {args.batch_size}")
+    
+    if args.epochs <= 0:
+        raise ValueError(f"Epochs must be positive, got {args.epochs}")
+    
+    if not Path(args.data_path).exists():
+        raise FileNotFoundError(f"Dataset not found: {args.data_path}")
+    
+    if args.mode == 'vade' and args.num_clusters <= 0:
+        raise ValueError(f"num_clusters must be positive for VaDE, got {args.num_clusters}")
+    
+    # Validate loss function parameters
+    if args.mse_weight < 0 or args.l1_weight < 0 or args.sparse_weight < 0:
+        raise ValueError("Loss weights must be non-negative")
+    
+    # Automatically enable sparse loss if sparse_weight is positive
+    args.use_sparse_loss = args.sparse_weight > 0
+    
+    if abs(args.mse_weight + args.l1_weight + args.sparse_weight - 1.0) > 1e-6:
+        # Normalize weights if they don't sum to 1
+        total_weight = args.mse_weight + args.l1_weight + args.sparse_weight
+        args.mse_weight /= total_weight
+        args.l1_weight /= total_weight
+        args.sparse_weight /= total_weight
+        print(f"Normalized loss weights: MSE={args.mse_weight:.3f}, L1={args.l1_weight:.3f}, Sparse={args.sparse_weight:.3f}")
+    
+    # Print sparse loss status
+    if args.use_sparse_loss:
+        print(f"Sparse loss enabled (sparse_weight={args.sparse_weight:.3f})")
+    else:
+        print("Sparse loss disabled (sparse_weight=0)")
 
 
 def setup_device(device_arg: str) -> str:
@@ -115,16 +304,38 @@ def generate_hidden_configs(search_dims: List[int], max_layers: int) -> List[Lis
     return configs
 
 
-def sparse_aware_loss(reconstructed: torch.Tensor, original: torch.Tensor) -> torch.Tensor:
-    """Custom loss function for sparse data."""
-    mse_loss = nn.MSELoss()(reconstructed, original)
-    non_zero_mask = (original != 0).float()
+def sparse_aware_loss(reconstructed, original, mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
+    """
+    Configurable sparse-aware loss function.
     
+    Combines MSE loss with L1 loss for sparse reconstruction,
+    with configurable weights for each component.
+    
+    Args:
+        reconstructed: Reconstructed data
+        original: Original data
+        mse_weight: Weight for MSE loss component
+        l1_weight: Weight for L1 loss component  
+        sparse_weight: Weight for sparse reconstruction component
+    """
+    # Standard MSE loss
+    mse_loss = nn.MSELoss()(reconstructed, original)
+    
+    # L1 loss for sparsity awareness (better for sparse data)
+    l1_loss = nn.L1Loss()(reconstructed, original)
+    
+    # Weight the losses: emphasize reconstruction of non-zero elements
+    non_zero_mask = (original != 0).float()
     if non_zero_mask.sum() > 0:
         weighted_mse = (non_zero_mask * (reconstructed - original) ** 2).sum() / non_zero_mask.sum()
-        return 0.7 * weighted_mse + 0.3 * mse_loss
+        weighted_l1 = (non_zero_mask * torch.abs(reconstructed - original)).sum() / non_zero_mask.sum()
+        
+        # Combine losses with configurable weights
+        total_loss = mse_weight * weighted_mse + l1_weight * weighted_l1 + sparse_weight * mse_loss
     else:
-        return mse_loss
+        total_loss = mse_loss
+    
+    return total_loss
 
 
 def train_configuration(config: List[int], latent_dim: int, train_loader: DataLoader, 
@@ -145,13 +356,17 @@ def train_configuration(config: List[int], latent_dim: int, train_loader: DataLo
     """
     print(f"\nTraining configuration: {config}")
     
-    # Create model
-    model = create_dynamic_autoencoder(
+    # Create model based on mode
+    model, prior = create_model(
         input_dim=24,
         latent_dim=latent_dim,
         hidden_dims=config,
-        dropout=0.1
-    ).to(device)
+        mode=args.mode,
+        num_clusters=args.num_clusters
+    )
+    model = model.to(device)
+    if prior is not None:
+        prior = prior.to(device)
     
     # Get model info
     model_info = model.get_model_info()
@@ -167,45 +382,32 @@ def train_configuration(config: List[int], latent_dim: int, train_loader: DataLo
     
     # Training loop
     for epoch in range(args.epochs):
-        # Training phase
-        model.train()
-        train_loss = 0
-        train_batches = 0
+        # Training phase based on mode
+        if args.mode == 'ae':
+            train_loss = train_epoch_ae(
+                model, train_loader, nn.MSELoss(), optimizer, device,
+                args.use_sparse_loss, args.mse_weight, args.l1_weight, args.sparse_weight
+            )
+        elif args.mode == 'vae':
+            train_loss = train_epoch_vae(
+                model, train_loader, optimizer, device,
+                args.mse_weight, args.l1_weight, args.sparse_weight
+            )
+        elif args.mode == 'vade':
+            train_loss = train_epoch_vade(
+                model, prior, train_loader, optimizer, device,
+                args.mse_weight, args.l1_weight, args.sparse_weight
+            )
+        else:
+            raise ValueError(f"Unsupported mode: {args.mode}")
         
-        for batch_data in train_loader:
-            if device == 'cpu' and batch_data.device != device:
-                batch_data = batch_data.to(device)
-            
-            optimizer.zero_grad()
-            reconstructed, _ = model(batch_data)
-            loss = sparse_aware_loss(reconstructed, batch_data)
-            
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item()
-            train_batches += 1
-        
-        train_loss /= train_batches
         train_losses.append(train_loss)
         
         # Test phase
-        model.eval()
-        test_loss = 0
-        test_batches = 0
-        
-        with torch.no_grad():
-            for batch_data in test_loader:
-                if device == 'cpu' and batch_data.device != device:
-                    batch_data = batch_data.to(device)
-                
-                reconstructed, _ = model(batch_data)
-                loss = sparse_aware_loss(reconstructed, batch_data)
-                
-                test_loss += loss.item()
-                test_batches += 1
-        
-        test_loss /= test_batches
+        test_loss = evaluate_model(
+            model, test_loader, device, args.use_sparse_loss,
+            args.mse_weight, args.l1_weight, args.sparse_weight
+        )
         test_losses.append(test_loss)
         
         # Update learning rate
@@ -347,7 +549,7 @@ def visualize_latent_space(model, train_loader, test_loader, device, output_dir:
     plt.grid(True, alpha=0.3)
     
     # Add statistics
-    plt.text(0.02, 0.98, f'Total Samples: {len(all_latents)}\nTrain: {np.sum(train_mask)}, Test: {np.sum(test_mask)}\nRange X: [{all_latents[:, 0].min():.3f}, {all_latents[:, 0].max():.3f}]\nRange Y: [{all_latents[:, 1].min():.3f}, {all_latents[:, 1].max():.3f}]',
+    plt.text(0.02, 0.98, f'Train: {np.sum(train_mask)}, Test: {np.sum(test_mask)}\nRange X: [{all_latents[:, 0].min():.3f}, {all_latents[:, 0].max():.3f}]\nRange Y: [{all_latents[:, 1].min():.3f}, {all_latents[:, 1].max():.3f}]',
              transform=plt.gca().transAxes, verticalalignment='top',
              bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
     
@@ -403,6 +605,9 @@ def main():
     
     # Parse arguments
     args = parse_arguments()
+    
+    # Validate arguments
+    validate_arguments(args)
     
     # Setup
     device = setup_device(args.device)

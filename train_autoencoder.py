@@ -19,20 +19,39 @@ import numpy as np
 # Import custom modules
 from dataset import COPUSDataset, create_copus_dataloader
 from models import SimpleAutoencoder, VariationalAutoencoder, GaussMixturePrior
-from utils import create_combined_plot
+# from utils import create_combined_plot  # No longer used; using local plotting helpers
 
 # Visualization
 import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend to avoid Qt/Wayland issues
 import matplotlib.pyplot as plt
 import seaborn as sns
 
 
-def setup_output_dir():
+def setup_output_dir(output_dir_path='output'):
     """Create output directory if it doesn't exist."""
-    output_dir = Path('output')
-    output_dir.mkdir(exist_ok=True)
+    output_dir = Path(output_dir_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
+
+def setup_matplotlib_backend(interactive: bool):
+    """Configure matplotlib backend.
+
+    If interactive is True, try to use a GUI backend (Qt5Agg or TkAgg). Otherwise, keep default.
+    Falls back gracefully if GUI backends are unavailable.
+    """
+    try:
+        if interactive:
+            # Prefer Qt5Agg, then TkAgg
+            for backend in ["Qt5Agg", "TkAgg"]:
+                try:
+                    matplotlib.use(backend, force=True)
+                    return
+                except Exception:
+                    continue
+        # If not interactive or no GUI backends available, keep current backend
+    except Exception as e:
+        print(f"Warning: Failed to set interactive backend: {e}")
 
 
 def parse_arguments():
@@ -66,12 +85,26 @@ def parse_arguments():
                        help='Device to use: auto, cuda, cpu (default: auto)')
     
     # Output
+    parser.add_argument('--output_dir', type=str, default='output',
+                       help='Output directory for plots and models (default: output)')
     parser.add_argument('--save_model', action='store_true',
                        help='Save trained model weights')
     parser.add_argument('--plot_freq', type=int, default=1,
                        help='Plot update frequency in epochs (default: 1)')
     parser.add_argument('--no_log_scale', action='store_true',
                        help='Disable log scale for loss plotting (default: False)')
+    parser.add_argument('--interactive_3d', action='store_true',
+                       help='Enable interactive 3D plot popup window for latent space visualization (default: False)')
+    
+    # Loss function configuration
+    parser.add_argument('--loss_weights', type=str, default='[0.7, 0.2, 0.1]',
+                       help='JSON list of loss weights [mse_weight, l1_weight, sparse_weight] (default: [0.7, 0.2, 0.1])')
+    parser.add_argument('--mse_weight', type=float, default=0.7,
+                       help='Weight for MSE loss component (default: 0.7)')
+    parser.add_argument('--l1_weight', type=float, default=0.2,
+                       help='Weight for L1 loss component (default: 0.2)')
+    parser.add_argument('--sparse_weight', type=float, default=0.0,
+                       help='Weight for sparse reconstruction component (default: 0.0, disabled)')
     
     return parser.parse_args()
 
@@ -104,6 +137,27 @@ def validate_arguments(args):
         raise FileNotFoundError(f"Dataset not found: {args.data_path}")
     if args.mode == 'vade' and args.num_clusters <= 0:
         raise ValueError(f"num_clusters must be positive for VaDE, got {args.num_clusters}")
+    
+    # Validate loss function parameters
+    if args.mse_weight < 0 or args.l1_weight < 0 or args.sparse_weight < 0:
+        raise ValueError("Loss weights must be non-negative")
+    
+    # Automatically enable sparse loss if sparse_weight is positive
+    args.use_sparse_loss = args.sparse_weight > 0
+    
+    if abs(args.mse_weight + args.l1_weight + args.sparse_weight - 1.0) > 1e-6:
+        # Normalize weights if they don't sum to 1
+        total_weight = args.mse_weight + args.l1_weight + args.sparse_weight
+        args.mse_weight /= total_weight
+        args.l1_weight /= total_weight
+        args.sparse_weight /= total_weight
+        print(f"Normalized loss weights: MSE={args.mse_weight:.3f}, L1={args.l1_weight:.3f}, Sparse={args.sparse_weight:.3f}")
+    
+    # Print sparse loss status
+    if args.use_sparse_loss:
+        print(f"Sparse loss enabled (sparse_weight={args.sparse_weight:.3f})")
+    else:
+        print("Sparse loss disabled (sparse_weight=0)")
 
 
 def setup_device(device_arg):
@@ -153,12 +207,19 @@ def create_model(input_dim, latent_dim, hidden_dims, mode, num_clusters=None):
             raise ValueError(f"Unsupported mode: {mode}")
 
 
-def sparse_aware_loss(reconstructed, original, sparsity_weight=0.1):
+def sparse_aware_loss(reconstructed, original, mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
     """
-    Custom loss function that handles sparse data better.
+    Configurable sparse-aware loss function.
     
     Combines MSE loss with L1 loss for sparse reconstruction,
-    giving more weight to non-zero elements.
+    with configurable weights for each component.
+    
+    Args:
+        reconstructed: Reconstructed data
+        original: Original data
+        mse_weight: Weight for MSE loss component
+        l1_weight: Weight for L1 loss component  
+        sparse_weight: Weight for sparse reconstruction component
     """
     # Standard MSE loss
     mse_loss = nn.MSELoss()(reconstructed, original)
@@ -172,8 +233,8 @@ def sparse_aware_loss(reconstructed, original, sparsity_weight=0.1):
         weighted_mse = (non_zero_mask * (reconstructed - original) ** 2).sum() / non_zero_mask.sum()
         weighted_l1 = (non_zero_mask * torch.abs(reconstructed - original)).sum() / non_zero_mask.sum()
         
-        # Combine losses with emphasis on non-zero reconstruction
-        total_loss = 0.7 * weighted_mse + 0.2 * weighted_l1 + 0.1 * mse_loss
+        # Combine losses with configurable weights
+        total_loss = mse_weight * weighted_mse + l1_weight * weighted_l1 + sparse_weight * mse_loss
     else:
         total_loss = mse_loss
     
@@ -183,8 +244,9 @@ def kl_standard_normal(mu, logvar):
     """KL divergence between q(z|x)=N(mu,diag(var)) and p(z)=N(0,I). Returns (batch,)."""
     return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
 
-def train_epoch_ae(model, dataloader, criterion, optimizer, device, use_sparse_loss=True):
-    """Train AE for one epoch with proper device handling."""
+def train_epoch_ae(model, dataloader, criterion, optimizer, device, use_sparse_loss=True, 
+                   mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
+    """Train AE for one epoch with proper device handling and configurable loss weights."""
     model.train()
     model = model.to(device)
     total_loss = 0
@@ -193,15 +255,18 @@ def train_epoch_ae(model, dataloader, criterion, optimizer, device, use_sparse_l
         batch_data = batch_data.to(device)
         optimizer.zero_grad()
         reconstructed, _ = model(batch_data)
-        loss = sparse_aware_loss(reconstructed, batch_data) if use_sparse_loss else criterion(reconstructed, batch_data)
+        if use_sparse_loss:
+            loss = sparse_aware_loss(reconstructed, batch_data, mse_weight, l1_weight, sparse_weight)
+        else:
+            loss = criterion(reconstructed, batch_data)
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
         num_batches += 1
     return total_loss / num_batches
 
-def train_epoch_vae(model, dataloader, optimizer, device):
-    """Train VAE for one epoch with sparse-aware reconstruction + KL to N(0,I)."""
+def train_epoch_vae(model, dataloader, optimizer, device, mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
+    """Train VAE for one epoch with configurable sparse-aware reconstruction + KL to N(0,I)."""
     model.train()
     model = model.to(device)
     total_loss = 0
@@ -210,7 +275,7 @@ def train_epoch_vae(model, dataloader, optimizer, device):
         batch_data = batch_data.to(device)
         optimizer.zero_grad()
         recon, z, mu, logvar = model(batch_data)
-        recon_loss = sparse_aware_loss(recon, batch_data)
+        recon_loss = sparse_aware_loss(recon, batch_data, mse_weight, l1_weight, sparse_weight)
         kl = kl_standard_normal(mu, logvar).mean()
         loss = recon_loss + kl
         loss.backward()
@@ -219,8 +284,8 @@ def train_epoch_vae(model, dataloader, optimizer, device):
         num_batches += 1
     return total_loss / num_batches
 
-def train_epoch_vade(model, prior, dataloader, optimizer, device):
-    """Train VaDE (VAE with GMM prior) for one epoch with proper device handling.
+def train_epoch_vade(model, prior, dataloader, optimizer, device, mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
+    """Train VaDE (VAE with GMM prior) for one epoch with configurable sparse reconstruction.
 
     Total loss = reconstruction + KL(q(z|x) || p(z|c)) + KL(q(c|x) || p(c)).
     """
@@ -234,7 +299,7 @@ def train_epoch_vade(model, prior, dataloader, optimizer, device):
         batch_data = batch_data.to(device)
         optimizer.zero_grad()
         recon, z, mu, logvar = model(batch_data)
-        recon_loss = sparse_aware_loss(recon, batch_data)
+        recon_loss = sparse_aware_loss(recon, batch_data, mse_weight, l1_weight, sparse_weight)
         gamma = prior.responsibilities(mu)  # (N, K)
         kl_z = prior.kl_z_given_c(mu, logvar, gamma).mean()
         kl_c = prior.kl_c(gamma).mean()
@@ -246,9 +311,153 @@ def train_epoch_vade(model, prior, dataloader, optimizer, device):
     return total_loss / num_batches
 
 
+def evaluate_model(model, dataloader, device, use_sparse_loss=True, mse_weight=0.7, l1_weight=0.2, sparse_weight=0.1):
+    """Evaluate model on a dataloader and return average reconstruction loss.
+
+    Uses the same sparse-aware reconstruction loss as training when enabled.
+    """
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+
+    with torch.no_grad():
+        for batch_data in dataloader:
+            # Handle device placement for CPU scenarios
+            if device == 'cpu' and getattr(batch_data, 'device', device) != device:
+                batch_data = batch_data.to(device)
+
+            outputs = model(batch_data)
+            if isinstance(outputs, tuple) and len(outputs) >= 2:
+                reconstructed = outputs[0]
+            else:
+                reconstructed = outputs
+
+            if use_sparse_loss:
+                loss = sparse_aware_loss(reconstructed, batch_data, mse_weight, l1_weight, sparse_weight)
+            else:
+                loss = nn.MSELoss()(reconstructed, batch_data)
+
+            total_loss += loss.item()
+            num_batches += 1
+
+    return total_loss / max(num_batches, 1)
+
+
+def plot_realtime_losses(train_losses, test_losses, current_epoch, output_dir, use_log_scale=True):
+    """Plot both training and testing loss up to current epoch and save to file.
+
+    Intended to be called during training to show both curves in real-time.
+    """
+    plt.figure(figsize=(12, 8))
+    sns.set_style("whitegrid")
+
+    epochs = np.arange(current_epoch + 1)
+    train_series = train_losses[:current_epoch + 1]
+    test_series = test_losses[:current_epoch + 1]
+
+    if use_log_scale:
+        train_series = np.log10(train_series + 1e-10)
+        test_series = np.log10(test_series + 1e-10)
+        ylabel = 'Log₁₀(MSE + ε)'
+    else:
+        ylabel = 'MSE'
+
+    plt.plot(epochs, train_series, marker='o', markersize=4, linewidth=2, color='blue', label='Train loss')
+    plt.plot(epochs, test_series, marker='o', markersize=4, linewidth=2, color='orange', label='Test loss')
+    plt.title(f'Training vs Testing Loss Progress (Epoch {current_epoch + 1})', fontsize=16, fontweight='bold')
+    plt.xlabel('Epoch', fontsize=14)
+    plt.ylabel(ylabel, fontsize=14)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+
+    plot_path = output_dir / 'testing_loss_progress.png'
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    return plot_path
+
+
+
+
+
+def plot_latent_space(model, dataloader, output_dir, latent_dim=3, device='cpu', title_suffix='', interactive=False, epoch=None):
+    """Create and save latent space visualization; optionally show interactive popup at the end.
+
+    Saves a latent visualization image.
+    If interactive=True, shows only the latent visualization in a popup window (no loss curves).
+    """
+    model.eval()
+    latents = []
+
+    with torch.no_grad():
+        for batch_data in dataloader:
+            if isinstance(batch_data, (list, tuple)):
+                batch_data = batch_data[0]
+            if getattr(batch_data, 'device', device) != device:
+                batch_data = batch_data.to(device)
+
+            outputs = model(batch_data)
+            if hasattr(model, 'encode'):
+                enc = model.encode(batch_data)
+                z = enc[0] if isinstance(enc, tuple) else enc
+            elif isinstance(outputs, tuple) and len(outputs) >= 2:
+                z = outputs[1]
+            else:
+                z = outputs
+
+            latents.append(z.detach().cpu().numpy())
+
+    all_latents = np.vstack(latents) if len(latents) > 0 else np.zeros((0, latent_dim))
+
+    if latent_dim == 2:
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111)
+        sns.set_style("whitegrid")
+        ax.scatter(all_latents[:, 0], all_latents[:, 1], c='blue', alpha=0.6, s=30, label=f'{len(all_latents)} Samples')
+        ax.set_xlabel('Latent Dimension 1', fontsize=12)
+        ax.set_ylabel('Latent Dimension 2', fontsize=12)
+        title = '2D Latent Space'
+        if title_suffix:
+            title += f' ({title_suffix})'
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+    else:
+        fig = plt.figure(figsize=(12, 9))
+        ax = fig.add_subplot(111, projection='3d')
+        ax.scatter(all_latents[:, 0], all_latents[:, 1], all_latents[:, 2], c='blue', alpha=0.6, s=30, label=f'{len(all_latents)} Samples')
+        ax.set_xlabel('Latent Dimension 1', fontsize=12)
+        ax.set_ylabel('Latent Dimension 2', fontsize=12)
+        ax.set_zlabel('Latent Dimension 3', fontsize=12)
+        title = '3D Latent Space'
+        if title_suffix:
+            title += f' ({title_suffix})'
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.legend()
+
+    # Generate filename based on whether this is a real-time or final plot
+    latent_plot_path = output_dir / 'latent_encodings.png'
+    if epoch is not None:
+        title_suffix = f"Epoch {epoch+1}"
+    
+    plt.tight_layout()
+    plt.savefig(latent_plot_path, dpi=150, bbox_inches='tight')
+
+    # Show interactive popup only for latent visualization if requested
+    if interactive:
+        try:
+            plt.show()
+        except Exception as e:
+            print(f"Warning: Interactive display failed: {e}")
+
+    plt.close()
+    return latent_plot_path
+
+
 def update_training_plots(epochs, losses, current_epoch, output_dir, model=None, 
                          dataloader=None, device='cpu', latent_dim=3, 
-                         use_log_scale=True, title_suffix=""):
+                         use_log_scale=True, title_suffix="", interactive_3d=False):
     """Update and save both loss plot and latent space visualization."""
     
     # Use the new combined plot function from utils
@@ -262,7 +471,8 @@ def update_training_plots(epochs, losses, current_epoch, output_dir, model=None,
         model=model,
         device=device,
         use_log_scale=use_log_scale,
-        title_suffix=title_suffix
+        title_suffix=title_suffix,
+        interactive_3d=interactive_3d
     )
     
     return combined_plot_path, latent_plot_path
@@ -278,8 +488,22 @@ def main():
         args = parse_arguments()
         validate_arguments(args)
         
+        # Set matplotlib backend based on interactive_3d flag
+        if args.interactive_3d:
+            # Try to use interactive backend, fallback to TkAgg if default fails
+            try:
+                matplotlib.use('Qt5Agg')  # Preferred interactive backend
+            except ImportError:
+                try:
+                    matplotlib.use('TkAgg')  # Fallback interactive backend
+                except ImportError:
+                    print("Warning: No interactive backend available. Interactive 3D plots will not display.")
+                    matplotlib.use('Agg')  # Fallback to non-interactive
+        else:
+            matplotlib.use('Agg')  # Use non-interactive backend for batch processing
+        
         # Setup
-        output_dir = setup_output_dir()
+        output_dir = setup_output_dir(args.output_dir)
         device = setup_device(args.device)
         
         print(f"Configuration:")
@@ -292,16 +516,28 @@ def main():
         print(f"  Min LR: {args.eta_min}")
         print(f"  Batch size: {args.batch_size}")
         print(f"  Epochs: {args.epochs}")
+        print(f"  Loss weights: MSE={args.mse_weight:.3f}, L1={args.l1_weight:.3f}, Sparse={args.sparse_weight:.3f}")
+        print(f"  Use sparse loss: {args.use_sparse_loss}")
         print()
         
         # Load dataset
         print("Loading dataset...")
         dataset = COPUSDataset(args.data_path, device=device)
-        print(f"Dataset loaded: {dataset.get_info()}")
+        info = dataset.get_info()
+        print(f"Dataset loaded: {info}")
         
-        # Create dataloader
-        dataloader = create_copus_dataloader(dataset, batch_size=args.batch_size, shuffle=True)
-        print(f"DataLoader created with batch size {args.batch_size}")
+        # Train/test split
+        from torch.utils.data import random_split
+        n = len(dataset)
+        train_size = int(0.8 * n)
+        test_size = n - train_size
+        train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+        
+        # Create dataloaders
+        train_loader = create_copus_dataloader(train_dataset, batch_size=args.batch_size, shuffle=True)
+        test_loader = create_copus_dataloader(test_dataset, batch_size=args.batch_size, shuffle=False)
+        full_loader = create_copus_dataloader(dataset, batch_size=args.batch_size, shuffle=False)
+        print(f"DataLoaders created: train={train_size} samples, test={test_size} samples, batch_size={args.batch_size}")
         
         # Create model
         print("Creating model...")
@@ -325,7 +561,8 @@ def main():
         scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.eta_min)
         
         # Training tracking
-        losses = np.zeros(args.epochs)
+        train_losses = np.zeros(args.epochs)
+        test_losses = np.zeros(args.epochs)
         epochs = np.arange(args.epochs)
         
         print(f"\nStarting training for {args.epochs} epochs...")
@@ -335,39 +572,50 @@ def main():
         for epoch in range(args.epochs):
             # Train for one epoch according to mode
             if args.mode == 'ae':
-                avg_loss = train_epoch_ae(model, dataloader, criterion, optimizer, device, use_sparse_loss=True)
+                avg_train_loss = train_epoch_ae(model, train_loader, criterion, optimizer, device, 
+                                                use_sparse_loss=args.use_sparse_loss,
+                                                mse_weight=args.mse_weight, l1_weight=args.l1_weight, 
+                                                sparse_weight=args.sparse_weight)
             elif args.mode == 'vae':
-                avg_loss = train_epoch_vae(model, dataloader, optimizer, device)
+                avg_train_loss = train_epoch_vae(model, train_loader, optimizer, device,
+                                                 mse_weight=args.mse_weight, l1_weight=args.l1_weight,
+                                                 sparse_weight=args.sparse_weight)
             elif args.mode == 'vade':
-                avg_loss = train_epoch_vade(model, prior, dataloader, optimizer, device)
+                avg_train_loss = train_epoch_vade(model, prior, train_loader, optimizer, device,
+                                                  mse_weight=args.mse_weight, l1_weight=args.l1_weight,
+                                                  sparse_weight=args.sparse_weight)
             else:
                 raise ValueError(f"Unsupported mode: {args.mode}")
-            losses[epoch] = avg_loss
+            train_losses[epoch] = avg_train_loss
+
+            # Evaluate on test set
+            avg_test_loss = evaluate_model(model, test_loader, device,
+                                           use_sparse_loss=args.use_sparse_loss,
+                                           mse_weight=args.mse_weight, l1_weight=args.l1_weight,
+                                           sparse_weight=args.sparse_weight)
+            test_losses[epoch] = avg_test_loss
             
             # Update learning rate
             scheduler.step()
             current_lr = scheduler.get_last_lr()[0]
             
             # Print progress
-            print(f"Epoch {epoch+1:3d}/{args.epochs} | Loss: {avg_loss:.4f} | LR: {current_lr:.6f}")
+            print(f"Epoch {epoch+1:3d}/{args.epochs} | Train Loss: {avg_train_loss:.4f} | Test Loss: {avg_test_loss:.4f} | LR: {current_lr:.6f}")
             
-            # Update plot
+            # Real-time loss plot update (both train and test losses)
             if (epoch + 1) % args.plot_freq == 0:
-                combined_plot_path, latent_plot_path = update_training_plots(
-                    epochs, losses, epoch, output_dir, 
-                    model=model, dataloader=dataloader, device=device,
-                    latent_dim=args.latent_dim,
-                    use_log_scale=not args.no_log_scale, 
-                    title_suffix=args.mode.upper()
-                )
-                print(f"  Combined plot updated: {combined_plot_path}")
-                if latent_plot_path:
-                    print(f"  Latent plot updated: {latent_plot_path}")
+                plot_realtime_losses(train_losses, test_losses, epoch, output_dir, use_log_scale=not args.no_log_scale)
+                
+                # Real-time latent space visualization
+                plot_latent_space(model, full_loader, output_dir, latent_dim=args.latent_dim, 
+                                device=device, title_suffix=args.mode.upper(), epoch=epoch)
         
         print("-" * 50)
         print(f"Training completed!")
-        print(f"Final loss: {losses[-1]:.4f}")
-        print(f"Best loss: {losses.min():.4f} (epoch {losses.argmin()+1})")
+        print(f"Final Train loss: {train_losses[-1]:.4f}")
+        print(f"Best Train loss: {train_losses.min():.4f} (epoch {train_losses.argmin()+1})")
+        print(f"Final Test loss: {test_losses[-1]:.4f}")
+        print(f"Best Test loss: {test_losses.min():.4f} (epoch {test_losses.argmin()+1})")
         
         # Save model if requested
         if args.save_model:
@@ -376,17 +624,11 @@ def main():
             torch.save(model.state_dict(), model_path)
             print(f"Model saved: {model_path}")
         
-        # Final combined plot
-        final_combined_plot_path, final_latent_plot_path = update_training_plots(
-            epochs, losses, args.epochs-1, output_dir,
-            model=model, dataloader=dataloader, device=device,
-            latent_dim=args.latent_dim,
-            use_log_scale=not args.no_log_scale, 
-            title_suffix=args.mode.upper()
-        )
-        print(f"Final combined plot saved: {final_combined_plot_path}")
-        if final_latent_plot_path:
-            print(f"Final latent plot saved: {final_latent_plot_path}")
+        # Real-time loss plot already shows both curves; no separate final curves file needed
+
+        # Final latent space visualization saved separately; interactive popup shows only latent
+        final_latent_plot_path = plot_latent_space(model, full_loader, output_dir, latent_dim=args.latent_dim, device=device, title_suffix=args.mode.upper(), interactive=args.interactive_3d)
+        print(f"Final latent plot saved: {final_latent_plot_path}")
         
         print(f"\nAll outputs saved to: {output_dir}")
         
